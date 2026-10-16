@@ -1,4 +1,4 @@
-# 🚀 Project Name
+# 🚀 Object Detection and Prevention
 
 A concise, one-sentence description of what your application does and the main problem it solves.
 
