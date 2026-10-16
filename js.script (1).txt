@@ -1,0 +1,841 @@
+(function(){
+"use strict";
+
+/* ============ Speech / captions / live region ============ */
+let voiceOn = true;
+let speechRate = 1.05;
+let verbosity = 'detailed'; // 'detailed' | 'short'
+const liveEl = document.getElementById('live');
+const captionEl = document.getElementById('caption');
+let captionTimer = null;
+
+function announceLive(text){
+  liveEl.textContent = "";
+  setTimeout(()=>{ liveEl.textContent = text; }, 30);
+  captionEl.textContent = text;
+  captionEl.classList.add('show');
+  clearTimeout(captionTimer);
+  captionTimer = setTimeout(()=> captionEl.classList.remove('show'), 3200);
+}
+function speak(text, interrupt){
+  announceLive(text);
+  if(!voiceOn || !('speechSynthesis' in window)) return;
+  if(interrupt) window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = speechRate;
+  window.speechSynthesis.speak(u);
+}
+function chatLog(msg, strong){
+  const log = document.getElementById('log');
+  const p = document.createElement('p');
+  p.className = 'new';
+  p.innerHTML = strong ? ('<b>'+strong+':</b> '+msg) : msg;
+  log.appendChild(p);
+  log.scrollTop = log.scrollHeight;
+  while(log.children.length > 30) log.removeChild(log.firstChild);
+}
+
+/* ============ Web Audio: 3D spatial ============ */
+let soundOn = true;
+let masterVol = 1.0;
+let actx = null;
+function ctx(){ if(!actx) actx = new (window.AudioContext||window.webkitAudioContext)(); return actx; }
+
+function updateListener(px,py,pz,fx,fz){
+  if(!actx) return;
+  const l = actx.listener;
+  if(l.positionX){
+    l.positionX.setValueAtTime(px, actx.currentTime);
+    l.positionY.setValueAtTime(py, actx.currentTime);
+    l.positionZ.setValueAtTime(pz, actx.currentTime);
+    l.forwardX.setValueAtTime(fx, actx.currentTime);
+    l.forwardY.setValueAtTime(0, actx.currentTime);
+    l.forwardZ.setValueAtTime(fz, actx.currentTime);
+    l.upX.setValueAtTime(0, actx.currentTime);
+    l.upY.setValueAtTime(1, actx.currentTime);
+    l.upZ.setValueAtTime(0, actx.currentTime);
+  } else if(l.setPosition){
+    l.setPosition(px,py,pz);
+    l.setOrientation(fx,0,fz, 0,1,0);
+  }
+}
+
+function makePanner(x,y,z){
+  const c = ctx();
+  const panner = c.createPanner();
+  panner.panningModel = 'HRTF';
+  panner.distanceModel = 'inverse';
+  panner.refDistance = 2;
+  panner.maxDistance = 70;
+  panner.rolloffFactor = 1.1;
+  if(panner.positionX){
+    panner.positionX.setValueAtTime(x, c.currentTime);
+    panner.positionY.setValueAtTime(y, c.currentTime);
+    panner.positionZ.setValueAtTime(z, c.currentTime);
+  } else if(panner.setPosition){
+    panner.setPosition(x,y,z);
+  }
+  return panner;
+}
+
+function ping3D(x,y,z, opts){
+  if(!soundOn) return;
+  opts = opts || {};
+  const c = ctx();
+  const osc = c.createOscillator();
+  const gain = c.createGain();
+  const panner = makePanner(x,y,z);
+  osc.type = opts.wave || 'sine';
+  osc.frequency.setValueAtTime(opts.freq || 520, c.currentTime);
+  if(opts.freqTo !== undefined){
+    osc.frequency.exponentialRampToValueAtTime(Math.max(opts.freqTo,20), c.currentTime + (opts.dur||0.28));
+  }
+  const vol = (opts.volume !== undefined ? opts.volume : 0.5) * masterVol;
+  gain.gain.setValueAtTime(0.0001, c.currentTime);
+  gain.gain.exponentialRampToValueAtTime(Math.max(vol,0.001), c.currentTime+0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001, c.currentTime + (opts.dur||0.28));
+  osc.connect(gain); gain.connect(panner); panner.connect(c.destination);
+  osc.start(); osc.stop(c.currentTime + (opts.dur||0.28) + 0.03);
+}
+// double-pulse "siren" for moving/patrol hazards -- distinct timbre from static ping
+function siren3D(x,y,z, opts){
+  if(!soundOn) return;
+  opts = opts || {};
+  ping3D(x,y,z, Object.assign({wave:'sawtooth', freq:(opts.freq||300), dur:0.12, volume:(opts.volume||0.4)}, {}));
+  setTimeout(()=>{ ping3D(x,y,z, Object.assign({wave:'sawtooth', freq:(opts.freq||300)*1.25, dur:0.12, volume:(opts.volume||0.4)*0.85}, {})); }, 130);
+}
+function twinkle3D(x,y,z, opts){
+  if(!soundOn) return;
+  opts = opts || {};
+  ping3D(x,y,z, {wave:'sine', freq:opts.freq||900, freqTo:(opts.freq||900)*1.6, dur:0.22, volume:opts.volume||0.35});
+}
+function tone2D(freq, dur, volume, wave){
+  if(!soundOn) return;
+  const c = ctx();
+  const osc = c.createOscillator();
+  const gain = c.createGain();
+  osc.type = wave || 'triangle';
+  osc.frequency.setValueAtTime(freq, c.currentTime);
+  gain.gain.setValueAtTime(0.0001, c.currentTime);
+  gain.gain.exponentialRampToValueAtTime((volume||0.25)*masterVol, c.currentTime+0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001, c.currentTime+(dur||0.3));
+  osc.connect(gain); gain.connect(c.destination);
+  osc.start(); osc.stop(c.currentTime+(dur||0.3)+0.03);
+}
+
+/* ============ Three.js scene ============ */
+const canvas = document.getElementById('scene');
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+
+const scene = new THREE.Scene();
+
+// procedural sky gradient texture
+function makeSkyTexture(){
+  const c = document.createElement('canvas');
+  c.width = 8; c.height = 256;
+  const g = c.getContext('2d');
+  const grad = g.createLinearGradient(0,0,0,256);
+  grad.addColorStop(0, '#5fb3e8');
+  grad.addColorStop(0.6, '#a9dcf2');
+  grad.addColorStop(1, '#e7f5fb');
+  g.fillStyle = grad; g.fillRect(0,0,8,256);
+  return new THREE.CanvasTexture(c);
+}
+scene.background = makeSkyTexture();
+scene.fog = new THREE.Fog(0xbfe3f2, 45, 105);
+
+const camera = new THREE.PerspectiveCamera(62, window.innerWidth/window.innerHeight, 0.1, 300);
+
+const hemi = new THREE.HemisphereLight(0xffffff, 0x3a6b35, 0.9);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 0.95);
+sun.position.set(20,30,10);
+sun.castShadow = true;
+sun.shadow.mapSize.set(1024,1024);
+sun.shadow.camera.left=-40; sun.shadow.camera.right=40; sun.shadow.camera.top=40; sun.shadow.camera.bottom=-40;
+scene.add(sun);
+
+const FIELD_HALF = 30;
+const groundGeo = new THREE.PlaneGeometry(FIELD_HALF*2, FIELD_HALF*2, 1,1);
+const groundMat = new THREE.MeshLambertMaterial({color:0x35b34a});
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI/2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+const grid = new THREE.GridHelper(FIELD_HALF*2, 20, 0x2a9a3d, 0x2a9a3d);
+grid.position.y = 0.01;
+scene.add(grid);
+
+/* ---- decorative, non-colliding scenery (visual polish only) ---- */
+function buildTree(){
+  const g = new THREE.Group();
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.18,0.22,1.2,6), new THREE.MeshLambertMaterial({color:0x8a5a34}));
+  trunk.position.y = 0.6; trunk.castShadow = true; g.add(trunk);
+  const leaves = new THREE.Mesh(new THREE.ConeGeometry(0.9,1.8,7), new THREE.MeshLambertMaterial({color:0x2e9e4f}));
+  leaves.position.y = 1.9; leaves.castShadow = true; g.add(leaves);
+  return g;
+}
+function buildRock(){
+  const mesh = new THREE.Mesh(new THREE.IcosahedronGeometry(randRange(0.35,0.7),0), new THREE.MeshLambertMaterial({color:0x8b93a1}));
+  mesh.castShadow = true;
+  mesh.rotation.set(Math.random()*Math.PI, Math.random()*Math.PI, 0);
+  return mesh;
+}
+function scatterScenery(){
+  for(let i=0;i<22;i++){
+    const x = randRange(-FIELD_HALF+1.5, FIELD_HALF-1.5);
+    const z = randRange(-FIELD_HALF+1.5, FIELD_HALF-1.5);
+    if(Math.abs(x) < 4 && z > 10) continue; // keep start lane clearer
+    const obj = Math.random() < 0.6 ? buildTree() : buildRock();
+    obj.position.set(x, 0, z);
+    scene.add(obj);
+  }
+}
+scatterScenery();
+
+/* ---- Blocky player avatar ---- */
+function buildAvatar(colors){
+  const g = new THREE.Group();
+  const mat = (c)=> new THREE.MeshLambertMaterial({color:c});
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.9,1.1,0.5), mat(colors.torso));
+  torso.position.y = 1.15; torso.castShadow = true; g.add(torso);
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.7,0.7,0.7), mat(colors.head));
+  head.position.y = 2.05; head.castShadow = true; g.add(head);
+  const visor = new THREE.Mesh(new THREE.BoxGeometry(0.5,0.16,0.08), new THREE.MeshLambertMaterial({color:0x1a2332}));
+  visor.position.set(0, 2.05, -0.39); g.add(visor); // marks the front of the avatar
+  const legL = new THREE.Mesh(new THREE.BoxGeometry(0.38,0.9,0.42), mat(colors.legs));
+  legL.position.set(-0.25,0.45,0); legL.castShadow = true; g.add(legL);
+  const legR = legL.clone(); legR.position.x = 0.25; g.add(legR);
+  const armL = new THREE.Mesh(new THREE.BoxGeometry(0.32,0.95,0.32), mat(colors.torso));
+  armL.position.set(-0.65,1.15,0); armL.castShadow = true; g.add(armL);
+  const armR = armL.clone(); armR.position.x = 0.65; g.add(armR);
+  g.userData.parts = {legL,legR,armL,armR};
+
+  // flat arrow on the ground ahead of the avatar, so the chase camera can show heading clearly
+  const arrow = new THREE.Mesh(
+    new THREE.ConeGeometry(0.22,0.55,4),
+    new THREE.MeshLambertMaterial({color:0xffcc4d})
+  );
+  arrow.rotation.x = -Math.PI/2;
+  arrow.rotation.z = Math.PI/4;
+  arrow.position.set(0, 0.04, -0.95);
+  g.add(arrow);
+
+  // shield ring, hidden by default
+  const shieldRing = new THREE.Mesh(
+    new THREE.TorusGeometry(0.95,0.06,8,24),
+    new THREE.MeshStandardMaterial({color:0x4fd8c4, emissive:0x2a9a8f, emissiveIntensity:0.8, transparent:true, opacity:0.85})
+  );
+  shieldRing.rotation.x = Math.PI/2;
+  shieldRing.position.y = 1.1;
+  shieldRing.visible = false;
+  g.add(shieldRing);
+  g.userData.shieldRing = shieldRing;
+
+  return g;
+}
+const player = buildAvatar({torso:0x2e7dd6, head:0xffcc99, legs:0x2b2f38});
+player.position.set(0, 0, FIELD_HALF-4);
+scene.add(player);
+player.visible = false; // first-person view: don't render our own body in front of the camera
+
+/* ---- Goal beacon ---- */
+const goalGeo = new THREE.OctahedronGeometry(0.8,0);
+const goalMat = new THREE.MeshStandardMaterial({color:0xffcc4d, emissive:0xaa7a00, emissiveIntensity:0.6, metalness:0.3, roughness:0.4});
+const goalMesh = new THREE.Mesh(goalGeo, goalMat);
+goalMesh.castShadow = true;
+const goalLight = new THREE.PointLight(0xffcc4d, 1.2, 12);
+goalMesh.add(goalLight);
+scene.add(goalMesh);
+
+/* ---- Hazards: static + patrol ---- */
+const staticHazardMat = new THREE.MeshLambertMaterial({color:0xe6483c});
+const patrolHazardMat = new THREE.MeshLambertMaterial({color:0xff9c3f});
+let hazards = []; // {mesh, radius, type, a, b, t, speed}
+
+function clearGroup(arr){ arr.forEach(o=> scene.remove(o.mesh)); arr.length = 0; }
+function randRange(a,b){ return a + Math.random()*(b-a); }
+
+function placeGoal(){
+  const gx = randRange(-FIELD_HALF+5, FIELD_HALF-5);
+  const gz = randRange(-FIELD_HALF+4, -8);
+  goalMesh.position.set(gx, 1.1, gz);
+  return goalMesh.position.clone();
+}
+
+function farEnough(p, list, minDist){
+  return !list.some(o => o.mesh.position.distanceTo(p) < minDist);
+}
+
+function spawnHazards(staticCount, patrolCount){
+  clearGroup(hazards);
+  const startPos = player.position.clone();
+  const goalPos = goalMesh.position.clone();
+  let attempts = 0;
+  while(hazards.length < staticCount && attempts < staticCount*25){
+    attempts++;
+    const p = new THREE.Vector3(randRange(-FIELD_HALF+3,FIELD_HALF-3), 0.6, randRange(-FIELD_HALF+3,FIELD_HALF-3));
+    if(p.distanceTo(startPos) < 6 || p.distanceTo(goalPos) < 5) continue;
+    if(!farEnough(p, hazards, 3.2)) continue;
+    const size = randRange(0.9,1.4);
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(size,size,size), staticHazardMat);
+    mesh.position.copy(p); mesh.castShadow = true;
+    scene.add(mesh);
+    hazards.push({mesh, radius:size*0.62+0.55, type:'static'});
+  }
+  attempts = 0;
+  let placed = 0;
+  while(placed < patrolCount && attempts < patrolCount*25){
+    attempts++;
+    const ax = randRange(-FIELD_HALF+3,FIELD_HALF-3), az = randRange(-FIELD_HALF+3,FIELD_HALF-3);
+    const a = new THREE.Vector3(ax,0.6,az);
+    if(a.distanceTo(startPos) < 6 || a.distanceTo(goalPos) < 5) continue;
+    if(!farEnough(a, hazards, 3.5)) continue;
+    const angle = Math.random()*Math.PI*2;
+    const len = randRange(4,9);
+    const b = new THREE.Vector3(a.x+Math.cos(angle)*len, 0.6, a.z+Math.sin(angle)*len);
+    b.x = Math.max(-FIELD_HALF+2, Math.min(FIELD_HALF-2, b.x));
+    b.z = Math.max(-FIELD_HALF+2, Math.min(FIELD_HALF-2, b.z));
+    const size = randRange(0.8,1.1);
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(size,size,size), patrolHazardMat);
+    mesh.position.copy(a); mesh.castShadow = true;
+    scene.add(mesh);
+    hazards.push({mesh, radius:size*0.62+0.55, type:'patrol', a, b, t:Math.random()*Math.PI*2, speed:randRange(0.6,1.1)});
+    placed++;
+  }
+}
+
+/* ---- Pickups: score orbs + shield orb ---- */
+const orbMat = new THREE.MeshStandardMaterial({color:0x5fd0ff, emissive:0x1c6f8f, emissiveIntensity:0.7});
+const shieldMat = new THREE.MeshStandardMaterial({color:0x4fd8c4, emissive:0x1f8a7d, emissiveIntensity:0.9});
+let orbs = [];      // {mesh, value}
+let powerups = [];  // {mesh, kind}
+
+function spawnPickups(orbCount, shieldChance){
+  clearGroup(orbs); clearGroup(powerups);
+  const startPos = player.position.clone();
+  const goalPos = goalMesh.position.clone();
+  let attempts = 0;
+  while(orbs.length < orbCount && attempts < orbCount*25){
+    attempts++;
+    const p = new THREE.Vector3(randRange(-FIELD_HALF+3,FIELD_HALF-3), 0.9, randRange(-FIELD_HALF+3,FIELD_HALF-3));
+    if(p.distanceTo(startPos) < 4 || p.distanceTo(goalPos) < 4) continue;
+    if(!farEnough(p, hazards, 2.2) || !farEnough(p, orbs, 2.5)) continue;
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.32,10,10), orbMat);
+    mesh.position.copy(p); mesh.castShadow = true;
+    scene.add(mesh);
+    orbs.push({mesh, value:10});
+  }
+  if(Math.random() < shieldChance){
+    attempts = 0;
+    while(attempts < 25){
+      attempts++;
+      const p = new THREE.Vector3(randRange(-FIELD_HALF+3,FIELD_HALF-3), 0.9, randRange(-FIELD_HALF+3,FIELD_HALF-3));
+      if(p.distanceTo(startPos) < 4 || p.distanceTo(goalPos) < 4) continue;
+      if(!farEnough(p, hazards, 2.5) || !farEnough(p, orbs, 2.5)) continue;
+      const mesh = new THREE.Mesh(new THREE.TetrahedronGeometry(0.42,0), shieldMat);
+      mesh.position.copy(p); mesh.castShadow = true;
+      scene.add(mesh);
+      powerups.push({mesh, kind:'shield'});
+      break;
+    }
+  }
+}
+
+function updateCamera(){
+  camera.position.set(player.position.x, player.position.y + 2.05, player.position.z);
+  camera.lookAt(player.position.x, player.position.y + 1.95, player.position.z - 10);
+}
+
+/* ============ Game state ============ */
+let running = false;
+let paused = false;
+let tutorialMode = false;
+let tutorialTips = {moved:false, scanned:false};
+let score=0, level=1, lives=3;
+let invuln = 0;
+let shieldTimer = 0;
+let pulseTimer = 0;
+let pulseInterval = 3.0;
+let hazardCount = 5;
+let patrolFraction = 0;
+let walkT = 0;
+let heading = 0; // fixed: player always faces world north (-Z), like the original controls
+const MOVE_SPEED = 6.0;
+const keys = {up:false,down:false,left:false,right:false};
+
+const scoreEl = document.getElementById('score');
+const levelEl = document.getElementById('level');
+const livesEl = document.getElementById('lives');
+const shieldTag = document.getElementById('shieldTag');
+const centerMsg = document.getElementById('centerMsg');
+const pauseMsg = document.getElementById('pauseMsg');
+
+function updateHUD(){
+  scoreEl.textContent = score;
+  levelEl.textContent = tutorialMode ? 'Practice' : level;
+  livesEl.textContent = "●".repeat(Math.max(lives,0)) + "○".repeat(Math.max(3-lives,0));
+  shieldTag.hidden = shieldTimer <= 0;
+}
+
+function flash(kind){
+  const el = document.getElementById('flash');
+  el.className = kind;
+  requestAnimationFrame(()=>{ setTimeout(()=>{ el.className=''; }, 260); });
+}
+
+/* ---- Google-Maps-style relative directions ----
+   The player always faces "north" (-Z), so left/right/ahead/behind
+   can be computed directly from world-space offsets, the way a
+   turn-by-turn nav app gives directions relative to your heading. */
+function bearingDeg(from, to){
+  const dx = to.x - from.x, dz = to.z - from.z;
+  const worldAngle = (Math.atan2(dx, -dz) * 180/Math.PI + 360) % 360; // 0 = world north
+  const headingDeg = (heading * 180/Math.PI + 360) % 360;
+  return ((worldAngle - headingDeg) % 360 + 360) % 360; // 0=ahead, 90=right, 180=behind, 270=left
+}
+function navPhrase(angle){
+  if(angle < 20 || angle > 340) return "straight ahead";
+  if(angle < 70) return "ahead, slightly right";
+  if(angle < 110) return "on your right";
+  if(angle < 160) return "behind you, to the right";
+  if(angle < 200) return "directly behind you";
+  if(angle < 250) return "behind you, to the left";
+  if(angle < 290) return "on your left";
+  return "ahead, slightly left";
+}
+function turnSide(angle){
+  if(angle >= 340 || angle < 20) return "straight ahead";
+  return angle < 180 ? "on your right" : "on your left";
+}
+function oppositeSide(side){
+  if(side.includes("right")) return "left";
+  if(side.includes("left")) return "right";
+  return Math.random() < 0.5 ? "left" : "right";
+}
+
+function nearestHazard(){
+  if(hazards.length===0) return null;
+  let best=null, bd=Infinity;
+  hazards.forEach(h=>{
+    const d = h.mesh.position.distanceTo(player.position);
+    if(d<bd){bd=d; best=h;}
+  });
+  return {hazard:best, dist:bd};
+}
+
+function doScan(manual){
+  hazards.forEach(h=>{
+    const d = h.mesh.position.distanceTo(player.position);
+    if(d < 45){
+      const vol = Math.max(0.05, 0.55 - d*0.01);
+      const freq = 200 + Math.max(0,(20-d))*18;
+      if(h.type === 'patrol'){
+        siren3D(h.mesh.position.x, 0.8, h.mesh.position.z, {freq, volume:vol});
+      } else {
+        ping3D(h.mesh.position.x, 0.8, h.mesh.position.z, {freq, dur:0.3, volume:vol, wave:'sine'});
+      }
+    }
+  });
+  orbs.forEach(o=>{
+    const d = o.mesh.position.distanceTo(player.position);
+    if(d < 30) twinkle3D(o.mesh.position.x, 0.9, o.mesh.position.z, {volume:Math.max(0.06,0.32-d*0.008)});
+  });
+  powerups.forEach(p=>{
+    const d = p.mesh.position.distanceTo(player.position);
+    if(d < 30) ping3D(p.mesh.position.x, 0.9, p.mesh.position.z, {wave:'triangle', freq:520, freqTo:1040, dur:0.35, volume:Math.max(0.08,0.4-d*0.008)});
+  });
+  const gd = goalMesh.position.distanceTo(player.position);
+  ping3D(goalMesh.position.x, 1.1, goalMesh.position.z, {freq: 880, dur:0.4, volume: Math.max(0.08,0.5-gd*0.008), wave:'triangle'});
+
+  if(!manual){
+    // proactive, Maps-style heads-up: only speak when a hazard is close and roughly ahead,
+    // so it feels like "in 8 meters, turn left" rather than constant chatter
+    const n = nearestHazard();
+    if(n && n.dist < 14){
+      const angle = bearingDeg(player.position, n.hazard.mesh.position);
+      const ahead = angle < 100 || angle > 260;
+      if(ahead){
+        const side = turnSide(angle);
+        const kind = n.hazard.type === 'patrol' ? "moving hazard" : "hazard";
+        if(n.dist < 4){
+          speak(kind.charAt(0).toUpperCase()+kind.slice(1) + " right ahead! Turn " + oppositeSide(side) + " now.", true);
+        } else {
+          speak("In " + Math.round(n.dist) + " meters, " + kind + " " + side + ". Keep " + oppositeSide(side) + ".");
+        }
+      }
+    }
+    return;
+  }
+
+  if(manual){
+    const n = nearestHazard();
+    const goalAngle = bearingDeg(player.position, goalMesh.position);
+    const goalDir = navPhrase(goalAngle);
+
+    if(gd < 1.6){ speak("You have arrived at your destination."); if(tutorialMode) tutorialTips.scanned = true; return; }
+
+    if(verbosity === 'short'){
+      if(!n){ speak("Clear ahead. Destination " + Math.round(gd) + " meters, " + goalDir + "."); }
+      else{
+        const side = turnSide(bearingDeg(player.position, n.hazard.mesh.position));
+        speak("Hazard " + Math.round(n.dist) + " meters, " + side + ". Destination " + Math.round(gd) + " meters, " + goalDir + ".");
+      }
+    } else {
+      if(!n){
+        speak("No hazards nearby. Continue toward your destination, it's " + Math.round(gd) + " meters, " + goalDir + ".");
+      } else {
+        const side = turnSide(bearingDeg(player.position, n.hazard.mesh.position));
+        const kind = n.hazard.type === 'patrol' ? "moving hazard" : "hazard";
+        if(n.dist < 5){
+          speak("Caution, a " + kind + " is just ahead, " + side + ". Turn " + oppositeSide(side) + " to avoid it. Your destination is " + Math.round(gd) + " meters, " + goalDir + ".", true);
+        } else {
+          speak("In " + Math.round(n.dist) + " meters, a " + kind + " " + side + ". Keep " + oppositeSide(side) + ". Destination is " + Math.round(gd) + " meters, " + goalDir + ".");
+        }
+      }
+    }
+    if(tutorialMode) tutorialTips.scanned = true;
+  }
+}
+
+function knockback(from, to){
+  const dir = new THREE.Vector3().subVectors(to, from).setY(0).normalize();
+  to.add(dir.multiplyScalar(2.2));
+  to.x = Math.max(-FIELD_HALF+1, Math.min(FIELD_HALF-1, to.x));
+  to.z = Math.max(-FIELD_HALF+1, Math.min(FIELD_HALF-1, to.z));
+}
+
+function endGame(){
+  running = false;
+  centerMsg.hidden = false;
+  centerMsg.querySelector('h2').textContent = "Game over";
+  centerMsg.querySelector('p').textContent = "Final score: " + score + ". Press Start (or Enter) to try again.";
+  const sb = document.getElementById('startBtn');
+  sb.textContent = "Play Again";
+  document.getElementById('skipTutorialBtn').hidden = true;
+  speak("Game over. Final score " + score + ". Press Enter to play again.", true);
+  chatLog("Final score: " + score + ".", "Game Over");
+}
+
+function beginLevel(n){
+  level = n;
+  hazardCount = Math.min(4 + (n-1)*2, 16);
+  patrolFraction = Math.min(0.15*(n-1), 0.6);
+  pulseInterval = Math.max(3.2 - (n-1)*0.15, 1.4);
+  const patrolCount = Math.round(hazardCount*patrolFraction);
+  const staticCount = hazardCount - patrolCount;
+  player.position.set(0,0,FIELD_HALF-4);
+  heading = 0;
+  placeGoal();
+  spawnHazards(staticCount, patrolCount);
+  spawnPickups(Math.min(2+Math.floor(n/2),5), 0.35);
+  updateHUD();
+}
+
+function levelUp(){
+  flash('win');
+  score += 25;
+  speak("You have arrived at your destination! Level " + (level+1) + ". More hazards ahead.", true);
+  chatLog("Reached the destination. Starting level " + (level+1) + ".", "Level Up");
+  beginLevel(level+1);
+}
+
+function setDifficultyBase(name, btn){
+  document.querySelectorAll('#easyBtn,#medBtn,#hardBtn').forEach(b=>b.setAttribute('aria-pressed','false'));
+  btn.setAttribute('aria-pressed','true');
+  window.__difficulty = name;
+  speak(name + " difficulty selected.");
+}
+window.__difficulty = 'easy';
+
+function applyDifficultyToLevel(){
+  const d = window.__difficulty;
+  if(d==='easy'){ hazardCount = Math.max(3, hazardCount-2); pulseInterval += 0.4; }
+  if(d==='hard'){ hazardCount = hazardCount+3; pulseInterval = Math.max(1.1, pulseInterval-0.5); }
+}
+
+function startTutorial(){
+  tutorialMode = true;
+  score = 0; lives = 3; invuln = 0; shieldTimer = 0; pulseTimer = 0;
+  tutorialTips = {moved:false, scanned:false};
+  player.position.set(0,0,FIELD_HALF-4);
+  heading = 0;
+  placeGoal();
+  goalMesh.position.set(0, 1.1, 6); // close, straight ahead
+  spawnHazards(1, 0);
+  hazards[0] && hazards[0].mesh.position.set(0, 0.6, -2); // directly on the straight path
+  spawnPickups(1, 0);
+  pulseInterval = 3.5;
+  running = true;
+  centerMsg.hidden = true;
+  updateHUD();
+  chatLog("Practice round: reach your destination, dodge the one hazard, grab the orb if you like.", "Tutorial");
+  speak("Practice round. Press the up arrow or W to head toward your destination, and use the arrow keys or WASD to move around. I'll give you turn-by-turn directions as you go.", true);
+}
+
+function finishTutorial(){
+  tutorialMode = false;
+  chatLog("Practice complete. Starting level 1.", "Tutorial");
+  speak("Nicely done. Starting the full game now.", true);
+  applyDifficultyToLevel();
+  score = 0;
+  beginLevel(1);
+}
+
+function startGame(fromSkip){
+  try{ ctx().resume(); }catch(e){}
+  if(fromSkip){
+    tutorialMode = false;
+    score=0; lives=3; invuln=0; shieldTimer=0; pulseTimer=0;
+    hazardCount = 5; patrolFraction = 0;
+    applyDifficultyToLevel();
+    running = true;
+    centerMsg.hidden = true;
+    beginLevel(1);
+    chatLog("Starting the full game.", "System");
+    speak("Game started. Walk forward to head toward your destination. Press Space any time for directions.", true);
+  } else {
+    startTutorial();
+  }
+}
+
+function togglePause(force){
+  if(!running && force !== false) return;
+  paused = (force !== undefined) ? force : !paused;
+  pauseMsg.hidden = !paused;
+  if(paused){ speak("Paused.", true); }
+  else { speak("Resumed."); }
+}
+
+/* ============ Input ============ */
+function setKey(name, val){
+  keys[name]=val;
+  if(val && tutorialMode) tutorialTips.moved = true;
+}
+document.addEventListener('keydown', (e)=>{
+  if(e.repeat) return;
+  switch(e.key){
+    case 'ArrowUp': case 'w': case 'W': setKey('up',true); break;
+    case 'ArrowDown': case 's': case 'S': setKey('down',true); break;
+    case 'ArrowLeft': case 'a': case 'A': setKey('left',true); break;
+    case 'ArrowRight': case 'd': case 'D': setKey('right',true); break;
+    case ' ': case 'Spacebar': e.preventDefault(); if(!paused) doScan(true); break;
+    case 'Enter': if(!running) startGame(false); break;
+    case 'p': case 'P': togglePause(); break;
+  }
+});
+document.addEventListener('keyup', (e)=>{
+  switch(e.key){
+    case 'ArrowUp': case 'w': case 'W': setKey('up',false); break;
+    case 'ArrowDown': case 's': case 'S': setKey('down',false); break;
+    case 'ArrowLeft': case 'a': case 'A': setKey('left',false); break;
+    case 'ArrowRight': case 'd': case 'D': setKey('right',false); break;
+  }
+});
+function bindHold(id, name){
+  const el = document.getElementById(id);
+  const on = (e)=>{ e.preventDefault(); setKey(name,true); };
+  const off = (e)=>{ e.preventDefault(); setKey(name,false); };
+  el.addEventListener('mousedown', on); el.addEventListener('mouseup', off); el.addEventListener('mouseleave', off);
+  el.addEventListener('touchstart', on, {passive:false}); el.addEventListener('touchend', off);
+}
+bindHold('upBtn','up'); bindHold('downBtn','down'); bindHold('leftBtn','left'); bindHold('rightBtn','right');
+document.getElementById('scanBtn').addEventListener('click', ()=>{ if(!paused) doScan(true); });
+document.getElementById('startBtn').addEventListener('click', ()=>startGame(false));
+document.getElementById('skipTutorialBtn').addEventListener('click', ()=>startGame(true));
+document.getElementById('pauseBtn').addEventListener('click', ()=>togglePause());
+document.getElementById('resumeBtn').addEventListener('click', ()=>togglePause(false));
+
+const voiceBtn = document.getElementById('voiceToggle');
+voiceBtn.addEventListener('click', function(){
+  voiceOn = !voiceOn;
+  this.setAttribute('aria-pressed', String(voiceOn));
+  this.textContent = "🗣 Voice: " + (voiceOn?"On":"Off");
+  announceLive("Voice narration " + (voiceOn?"on":"off"));
+});
+const soundBtn = document.getElementById('soundToggle');
+soundBtn.addEventListener('click', function(){
+  soundOn = !soundOn;
+  this.setAttribute('aria-pressed', String(soundOn));
+  this.textContent = "🔈 Sonar: " + (soundOn?"On":"Off");
+  speak("Sonar sound " + (soundOn?"on":"off"));
+});
+const verbosityBtn = document.getElementById('verbosityToggle');
+verbosityBtn.addEventListener('click', function(){
+  verbosity = verbosity === 'detailed' ? 'short' : 'detailed';
+  this.setAttribute('aria-pressed', String(verbosity==='detailed'));
+  this.textContent = verbosity === 'detailed' ? "📝 Detailed cues" : "📝 Short cues";
+  speak(verbosity + " cue style selected.");
+});
+document.getElementById('easyBtn').addEventListener('click', function(){ setDifficultyBase('easy', this); });
+document.getElementById('medBtn').addEventListener('click', function(){ setDifficultyBase('medium', this); });
+document.getElementById('hardBtn').addEventListener('click', function(){ setDifficultyBase('hard', this); });
+
+document.getElementById('volSlider').addEventListener('input', function(){
+  masterVol = Number(this.value)/100;
+});
+document.getElementById('rateSlider').addEventListener('input', function(){
+  speechRate = Number(this.value)/100;
+});
+
+/* ============ Main loop ============ */
+let lastT = performance.now();
+function animate(now){
+  requestAnimationFrame(animate);
+  const dt = Math.min((now-lastT)/1000, 0.05);
+  lastT = now;
+
+  goalMesh.rotation.y += dt*1.2;
+  goalMesh.position.y = 1.1 + Math.sin(now*0.002)*0.15;
+  orbs.forEach((o,i)=>{ o.mesh.rotation.y += dt*2; o.mesh.position.y = 0.9 + Math.sin(now*0.003+i)*0.12; });
+  powerups.forEach((p)=>{ p.mesh.rotation.y += dt*3; p.mesh.rotation.x += dt*1.5; });
+
+  if(running && !paused){
+    // patrol hazard movement
+    hazards.forEach(h=>{
+      if(h.type === 'patrol'){
+        h.t += dt*h.speed;
+        const s = (Math.sin(h.t)+1)/2;
+        h.mesh.position.lerpVectors(h.a, h.b, s);
+        h.mesh.rotation.y += dt*2;
+      }
+    });
+
+    let mx=0, mz=0;
+    if(keys.up) mz -= 1;
+    if(keys.down) mz += 1;
+    if(keys.left) mx -= 1;
+    if(keys.right) mx += 1;
+    const moving = (mx!==0 || mz!==0);
+    if(moving){
+      const len = Math.hypot(mx,mz);
+      mx/=len; mz/=len;
+      player.position.x += mx*MOVE_SPEED*dt;
+      player.position.z += mz*MOVE_SPEED*dt;
+      player.position.x = Math.max(-FIELD_HALF+1, Math.min(FIELD_HALF-1, player.position.x));
+      player.position.z = Math.max(-FIELD_HALF+1, Math.min(FIELD_HALF-1, player.position.z));
+      walkT += dt*8;
+      const parts = player.userData.parts;
+      const swing = Math.sin(walkT)*0.55;
+      parts.legL.rotation.x = swing; parts.legR.rotation.x = -swing;
+      parts.armL.rotation.x = -swing; parts.armR.rotation.x = swing;
+    } else {
+      const parts = player.userData.parts;
+      parts.legL.rotation.x *= 0.8; parts.legR.rotation.x *= 0.8;
+      parts.armL.rotation.x *= 0.8; parts.armR.rotation.x *= 0.8;
+    }
+
+    updateListener(player.position.x, 1.2, player.position.z, 0, -1);
+
+    // tutorial guided tips
+    if(tutorialMode){
+      if(!tutorialTips.moved && now % 6000 < 20){ /* passive, handled via timers below */ }
+    }
+
+    pulseTimer += dt;
+    if(pulseTimer >= pulseInterval){
+      pulseTimer = 0;
+      doScan(false);
+    }
+
+    if(shieldTimer > 0){
+      shieldTimer -= dt;
+      player.userData.shieldRing.visible = true;
+      player.userData.shieldRing.rotation.z += dt*3;
+      if(shieldTimer <= 0){ player.userData.shieldRing.visible = false; speak("Shield expired."); updateHUD(); }
+    }
+
+    if(invuln>0) invuln -= dt;
+    if(invuln<=0 && shieldTimer<=0){
+      for(const h of hazards){
+        const d = h.mesh.position.distanceTo(player.position);
+        if(d < h.radius){
+          lives -= 1;
+          invuln = 1.4;
+          flash('hit');
+          tone2D(140,0.35,0.35,'sawtooth');
+          const side = turnSide(bearingDeg(player.position, h.mesh.position));
+          speak("Ouch! Hazard " + side + ". Lives left: " + Math.max(lives,0) + ".", true);
+          chatLog("Collided with a hazard (" + dir + "). Lives: " + Math.max(lives,0) + ".", "Hit");
+          knockback(h.mesh.position, player.position);
+          updateHUD();
+          if(lives<=0 && !tutorialMode){ endGame(); }
+          else if(lives<=0 && tutorialMode){ lives = 3; player.position.set(0,0,FIELD_HALF-4); heading = 0; speak("Let's try that again.", true); updateHUD(); }
+          break;
+        }
+      }
+    } else if(invuln<=0 && shieldTimer>0){
+      for(const h of hazards){
+        const d = h.mesh.position.distanceTo(player.position);
+        if(d < h.radius){
+          invuln = 0.6;
+          tone2D(700,0.15,0.2,'sine');
+          speak("Shield absorbed a hit.");
+          knockback(h.mesh.position, player.position);
+          break;
+        }
+      }
+    }
+
+    // orb pickup
+    for(let i=orbs.length-1;i>=0;i--){
+      const o = orbs[i];
+      if(o.mesh.position.distanceTo(player.position) < 0.9){
+        score += o.value;
+        flash('pick');
+        twinkle3D(o.mesh.position.x,0.9,o.mesh.position.z,{volume:0.4});
+        chatLog("Collected a bonus orb. +" + o.value + " points.", "Pickup");
+        scene.remove(o.mesh);
+        orbs.splice(i,1);
+        updateHUD();
+      }
+    }
+    // shield pickup
+    for(let i=powerups.length-1;i>=0;i--){
+      const p = powerups[i];
+      if(p.mesh.position.distanceTo(player.position) < 0.9){
+        shieldTimer = 8;
+        flash('pick');
+        ping3D(p.mesh.position.x,0.9,p.mesh.position.z,{wave:'triangle',freq:500,freqTo:1200,dur:0.4,volume:0.4});
+        speak("Shield activated! You're briefly immune to hazards.", true);
+        chatLog("Picked up a shield power-up.", "Pickup");
+        scene.remove(p.mesh);
+        powerups.splice(i,1);
+        updateHUD();
+      }
+    }
+
+    const gd2 = goalMesh.position.distanceTo(player.position);
+    if(gd2 < 1.6){
+      if(tutorialMode) finishTutorial();
+      else levelUp();
+    }
+  }
+
+  updateCamera();
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(animate);
+
+window.addEventListener('resize', ()=>{
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+/* one-shot tutorial nudge timers, set up when tutorial starts */
+setInterval(()=>{
+  if(!tutorialMode || !running || paused) return;
+  if(!tutorialTips.moved){
+    speak("Tip: press the up arrow, or the on-screen up button, to walk forward.");
+  } else if(!tutorialTips.scanned){
+    speak("Tip: press Space, or the scan button, for turn-by-turn directions to your destination.");
+  }
+}, 6000);
+
+updateHUD();
+})();
